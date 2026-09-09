@@ -1,0 +1,19 @@
+# Each message is separated by a line containing only ---
+# Lines starting with # in column 0 are comments. To send a line that really
+# begins with a hashtag, indent it by one space.
+# HTML formatting is allowed:
+# <b>bold</b>  <i>italic</i>  <code>code</code>  <a href="https://x.com">link</a>
+# Set ROTATION=sequential to cycle in order, or ROTATION=random to shuffle.
+
+<b>Reminder</b>
+Standup notes go in the thread before 10:00.
+
+---
+
+Hey everyone 👋
+Don't forget to check the pinned message.
+
+---
+
+<b>Daily check-in</b>
+What are you working on today?

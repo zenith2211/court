@@ -1,0 +1,46 @@
+# Render Blueprint. Deploy with: https://dashboard.render.com/blueprints
+#
+# A background worker is the right shape for this job: no inbound traffic, it
+# just runs the loop. Render has no free worker tier, so if you want to stay on
+# the free plan, comment out the worker below and uncomment the web service.
+
+services:
+  - type: worker
+    name: telegram-scheduler
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py loop
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false # set this in the Render dashboard, not in git
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: INTERVAL
+        value: 1h
+      - key: ROTATION
+        value: sequential
+      - key: PARSE_MODE
+        value: HTML
+      - key: SEND_ON_START
+        value: "true"
+
+  # Free-plan alternative. Render suspends free web services after 15 minutes
+  # with no inbound requests, which stops the loop, so point an external pinger
+  # (UptimeRobot, cron-job.org) at the service URL every 5-10 minutes to keep it
+  # awake. bot.py serves a JSON status page on $PORT for exactly this.
+  #
+  # - type: web
+  #   name: telegram-scheduler
+  #   runtime: python
+  #   plan: free
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: python bot.py loop
+  #   healthCheckPath: /
+  #   envVars:
+  #     - key: TELEGRAM_BOT_TOKEN
+  #       sync: false
+  #     - key: TELEGRAM_CHAT_ID
+  #       sync: false
+  #     - key: INTERVAL
+  #       value: 1h
