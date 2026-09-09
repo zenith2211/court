@@ -80,18 +80,25 @@ use `ROTATION=random` if that bothers you.
 
 ## Deploying to Render
 
-`render.yaml` defines a **background worker**, which is the right shape for this:
-no inbound traffic, it just runs the loop. Render has no free worker tier
-(starter is $7/month).
+`render.yaml` deploys a **free web service** running `python bot.py loop`.
 
-To stay free instead, use the commented-out web service in `render.yaml`. Render
-suspends free web services after 15 minutes without inbound requests, which
-stops the loop — so point a free external pinger ([UptimeRobot](https://uptimerobot.com),
-[cron-job.org](https://cron-job.org)) at the service URL every 5–10 minutes.
-`bot.py` serves a status JSON on `$PORT` for that purpose.
+Render suspends free web services after 15 minutes with no inbound requests,
+which would stop the loop. So after the service is live, point a free pinger at
+its URL every 5–10 minutes to keep it awake:
 
-Either way, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the Render
-dashboard under **Environment** — never commit them.
+- [UptimeRobot](https://uptimerobot.com) — add an HTTP(s) monitor, 5 min interval
+- [cron-job.org](https://cron-job.org) — add a job hitting the URL every 5 min
+
+`bot.py` answers any path with a status JSON, so the bare service URL works as
+the monitor target. The free plan allows 750 instance-hours/month across your
+account — enough for exactly one always-on service.
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the Render dashboard under
+**Environment** — never commit them.
+
+If you'd rather not deal with the pinger, switch to the background worker that's
+commented out at the bottom of `render.yaml`: always on, nothing to keep awake,
+$7/month.
 
 ### Free alternative: GitHub Actions
 

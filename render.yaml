@@ -1,19 +1,25 @@
 # Render Blueprint. Deploy with: https://dashboard.render.com/blueprints
 #
-# A background worker is the right shape for this job: no inbound traffic, it
-# just runs the loop. Render has no free worker tier, so if you want to stay on
-# the free plan, comment out the worker below and uncomment the web service.
+# This uses a free web service. Render suspends free web services after 15
+# minutes with no inbound requests, which would stop the loop - so point a free
+# external pinger (UptimeRobot, cron-job.org) at the service URL every 5-10
+# minutes to keep it awake. bot.py serves a JSON status page on $PORT for that.
+#
+# Note: the free plan gives 750 instance-hours per month across your whole
+# account, which is just enough for one always-on service.
 
 services:
-  - type: worker
+  - type: web
     name: telegram-scheduler
     runtime: python
-    plan: starter
+    plan: free
+    region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py loop
+    healthCheckPath: /
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false # set this in the Render dashboard, not in git
+        sync: false # set this in the Render dashboard, never in git
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: INTERVAL
@@ -25,18 +31,15 @@ services:
       - key: SEND_ON_START
         value: "true"
 
-  # Free-plan alternative. Render suspends free web services after 15 minutes
-  # with no inbound requests, which stops the loop, so point an external pinger
-  # (UptimeRobot, cron-job.org) at the service URL every 5-10 minutes to keep it
-  # awake. bot.py serves a JSON status page on $PORT for exactly this.
+  # If you later want this done properly, switch to a background worker: always
+  # on, no pinger, no sleep. Render's cheapest worker plan is $7/month.
   #
-  # - type: web
+  # - type: worker
   #   name: telegram-scheduler
   #   runtime: python
-  #   plan: free
+  #   plan: starter
   #   buildCommand: pip install -r requirements.txt
   #   startCommand: python bot.py loop
-  #   healthCheckPath: /
   #   envVars:
   #     - key: TELEGRAM_BOT_TOKEN
   #       sync: false
