@@ -2,11 +2,8 @@
 #
 # This uses a free web service. Render suspends free web services after 15
 # minutes with no inbound requests, which would stop the loop - so point a free
-# external pinger (UptimeRobot, cron-job.org) at the service URL every 5-10
-# minutes to keep it awake. bot.py serves a JSON status page on $PORT for that.
-#
-# Note: the free plan gives 750 instance-hours per month across your whole
-# account, which is just enough for one always-on service.
+# external pinger (https://uptimerobot.com) at the service URL every 5 minutes
+# to keep it awake.
 
 services:
   - type: web
@@ -19,35 +16,18 @@ services:
     healthCheckPath: /
     envVars:
       - key: TELEGRAM_API_ID
-        sync: false # set this in the Render dashboard, never in git
+        sync: false
       - key: TELEGRAM_API_HASH
         sync: false
       - key: TELEGRAM_PHONE
         sync: false
+      - key: TELEGRAM_SESSION
+        sync: false # base64-encoded .session file
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: INTERVAL
         value: 1h
       - key: ROTATION
         value: sequential
-      - key: PARSE_MODE
-        value: HTML
       - key: SEND_ON_START
         value: "true"
-
-  # If you later want this done properly, switch to a background worker: always
-  # on, no pinger, no sleep. Render's cheapest worker plan is $7/month.
-  #
-  # - type: worker
-  #   name: telegram-scheduler
-  #   runtime: python
-  #   plan: starter
-  #   buildCommand: pip install -r requirements.txt
-  #   startCommand: python bot.py loop
-  #   envVars:
-  #     - key: TELEGRAM_BOT_TOKEN
-  #       sync: false
-  #     - key: TELEGRAM_CHAT_ID
-  #       sync: false
-  #     - key: INTERVAL
-  #       value: 1h

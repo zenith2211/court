@@ -16,6 +16,7 @@ script). See .env.example for the full list.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -105,6 +106,12 @@ class Config:
     async def get_client(self) -> TelegramClient:
         api_id, api_hash = self.require_api_credentials()
         session_path = str(ROOT / self.session_name)
+
+        session_b64 = os.environ.get("TELEGRAM_SESSION", "").strip()
+        if session_b64 and not Path(session_path + ".session").exists():
+            Path(session_path + ".session").write_bytes(base64.b64decode(session_b64))
+            log.info("Restored session from TELEGRAM_SESSION env var.")
+
         client = TelegramClient(session_path, api_id, api_hash)
         await client.connect()
         if not await client.is_user_authorized():
