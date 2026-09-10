@@ -296,50 +296,47 @@ async def cmd_loop(cfg: Config) -> int:
     if cfg.port:
         start_health_server(int(cfg.port), status)
 
-    client = await cfg.get_client()
-    try:
-        me = await client.get_me()
-        log.info("Logged in as %s (id %s)", me.first_name, me.id)
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: stop.set())
 
-        stop = asyncio.Event()
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
+    next_run = time.monotonic()
+    if not cfg.send_on_start:
+        next_run += cfg.interval
+        log.info("SEND_ON_START is off; first message in %ss", cfg.interval)
+
+    status["state"] = "running"
+
+    while not stop.is_set():
+        wait_for = next_run - time.monotonic()
+        if wait_for > 0:
             try:
-                loop.add_signal_handler(sig, stop.set)
-            except NotImplementedError:
-                signal.signal(sig, lambda *_: stop.set())
-
-        next_run = time.monotonic()
-        if not cfg.send_on_start:
-            next_run += cfg.interval
-            log.info("SEND_ON_START is off; first message in %ss", cfg.interval)
-
-        status["state"] = "running"
-
-        while not stop.is_set():
-            wait_for = next_run - time.monotonic()
-            if wait_for > 0:
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=wait_for)
-                    break
-                except asyncio.TimeoutError:
-                    pass
-
-            if not await ensure_connected(client):
-                log.error("Cannot re-authorize on server, stopping.")
+                await asyncio.wait_for(stop.wait(), timeout=wait_for)
                 break
+            except asyncio.TimeoutError:
+                pass
 
-            text = pick_message(cfg, messages)
-            sent = await send_to_all(client, cfg, text)
-            status["sent"] += sent
-            status["last_sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
-            log.info("Sent to %d/%d group(s) (%d total)", sent, len(chat_ids), status["sent"])
+        try:
+            client = await cfg.get_client()
+            try:
+                text = pick_message(cfg, messages)
+                sent = await send_to_all(client, cfg, text)
+                status["sent"] += sent
+                status["last_sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
+                log.info("Sent to %d/%d group(s) (%d total)", sent, len(chat_ids), status["sent"])
+            finally:
+                await client.disconnect()
+        except Exception as exc:
+            log.error("Send cycle failed: %s", exc)
+            status["last_error"] = str(exc)
 
-            now = time.monotonic()
-            while next_run <= now:
-                next_run += cfg.interval
-    finally:
-        await client.disconnect()
+        now = time.monotonic()
+        while next_run <= now:
+            next_run += cfg.interval
 
     log.info("Stopped after sending %d message(s).", status["sent"])
     return 0
