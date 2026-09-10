@@ -1,10 +1,13 @@
-"""Post messages to a Telegram group on a fixed interval.
+"""Post messages to Telegram groups on a fixed interval using a user account.
 
 Commands:
     python bot.py loop      run forever, sending every INTERVAL (default)
-    python bot.py once      send a single message and exit (for cron)
-    python bot.py check     verify the token and chat id are usable
-    python bot.py chat-id   list chats the bot has seen, to find your group id
+    python bot.py once      send a single message and exit
+    python bot.py check     verify the session and list target groups
+    python bot.py groups    list all groups/channels you've joined
+
+First run will prompt for your phone number and a login code from Telegram.
+After that the session is saved and login is automatic.
 
 Configuration comes from environment variables (or a .env file next to this
 script). See .env.example for the full list.
@@ -12,6 +15,7 @@ script). See .env.example for the full list.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,11 +27,10 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import requests
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError
 
 ROOT = Path(__file__).resolve().parent
-API_BASE = "https://api.telegram.org"
-
 log = logging.getLogger("telegram-scheduler")
 
 
@@ -36,7 +39,6 @@ log = logging.getLogger("telegram-scheduler")
 # --------------------------------------------------------------------------- #
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
-    """Load KEY=VALUE lines from a .env file without overriding real env vars."""
     if not path.exists():
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -50,7 +52,6 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 
 
 def parse_interval(raw: str) -> int:
-    """Turn '30', '30s', '15m', '2h' or '1d' into a number of seconds."""
     text = raw.strip().lower()
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     multiplier = 1
@@ -72,33 +73,51 @@ def env_flag(name: str, default: bool) -> bool:
 
 class Config:
     def __init__(self) -> None:
-        self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-        self.thread_id = os.environ.get("TELEGRAM_THREAD_ID", "").strip()
+        self.api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
+        self.api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
+        self.phone = os.environ.get("TELEGRAM_PHONE", "").strip()
+        self.session_name = os.environ.get("SESSION_NAME", "user_session").strip()
+        raw_chat_ids = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self.chat_ids = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
         self.interval = parse_interval(os.environ.get("INTERVAL", "1h"))
         self.messages_file = ROOT / os.environ.get("MESSAGES_FILE", "messages.txt")
         self.single_message = os.environ.get("MESSAGE", "")
         self.rotation = os.environ.get("ROTATION", "sequential").strip().lower()
-        self.parse_mode = os.environ.get("PARSE_MODE", "HTML").strip()
-        self.silent = env_flag("SILENT", False)
         self.send_on_start = env_flag("SEND_ON_START", True)
         self.state_file = ROOT / os.environ.get("STATE_FILE", ".state.json")
         self.port = os.environ.get("PORT", "").strip()
 
-    def require_token(self) -> str:
-        if not self.token:
+    def require_api_credentials(self) -> tuple[int, str]:
+        if not self.api_id or not self.api_hash:
             raise SystemExit(
-                "TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather, then put "
-                "the token in your .env file or in your host's environment variables."
+                "TELEGRAM_API_ID and TELEGRAM_API_HASH are not set.\n"
+                "Get them from https://my.telegram.org/apps and put them in your .env file."
             )
-        return self.token
+        return int(self.api_id), self.api_hash
 
-    def require_chat_id(self) -> str:
-        if not self.chat_id:
+    def require_chat_ids(self) -> list[str]:
+        if not self.chat_ids:
             raise SystemExit(
-                "TELEGRAM_CHAT_ID is not set. Run `python bot.py chat-id` to find it."
+                "TELEGRAM_CHAT_ID is not set. Run `python bot.py groups` to find group ids."
             )
-        return self.chat_id
+        return self.chat_ids
+
+    async def get_client(self) -> TelegramClient:
+        api_id, api_hash = self.require_api_credentials()
+        session_path = str(ROOT / self.session_name)
+        client = TelegramClient(session_path, api_id, api_hash)
+        await client.connect()
+        if not await client.is_user_authorized():
+            phone = self.phone or input("Enter your phone number (with country code, e.g. +91...): ").strip()
+            await client.send_code_request(phone)
+            code = input("Enter the code Telegram sent you: ").strip()
+            try:
+                await client.sign_in(phone, code)
+            except Exception:
+                password = input("Two-factor password required: ").strip()
+                await client.sign_in(password=password)
+            log.info("Login successful. Session saved.")
+        return client
 
 
 # --------------------------------------------------------------------------- #
@@ -106,7 +125,6 @@ class Config:
 # --------------------------------------------------------------------------- #
 
 def load_messages(cfg: Config) -> list[str]:
-    """Read the message pool. Entries in the file are separated by a `---` line."""
     if cfg.single_message:
         return [cfg.single_message.replace("\\n", "\n")]
 
@@ -116,9 +134,6 @@ def load_messages(cfg: Config) -> list[str]:
             "with one or more messages separated by a line containing ---"
         )
 
-    # Split on lines that are exactly `---`, dropping comment lines as we go. A
-    # `#` only starts a comment in column 0, so an indented line keeps its
-    # leading hashtag - that is the escape hatch for messages full of hashtags.
     messages: list[str] = []
     current: list[str] = []
     for line in cfg.messages_file.read_text(encoding="utf-8").splitlines():
@@ -147,12 +162,11 @@ def read_state(cfg: Config) -> dict:
 def write_state(cfg: Config, state: dict) -> None:
     try:
         cfg.state_file.write_text(json.dumps(state), encoding="utf-8")
-    except OSError as exc:  # a read-only disk should not stop us sending
+    except OSError as exc:
         log.warning("Could not save state to %s: %s", cfg.state_file.name, exc)
 
 
 def pick_message(cfg: Config, messages: list[str]) -> str:
-    """Choose the next message, advancing the saved position when sequential."""
     if len(messages) == 1:
         return messages[0]
     if cfg.rotation == "random":
@@ -166,71 +180,40 @@ def pick_message(cfg: Config, messages: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Telegram API
+# Sending
 # --------------------------------------------------------------------------- #
 
-def call_api(cfg: Config, method: str, payload: dict | None = None, attempts: int = 4) -> dict:
-    """Call a Bot API method, retrying on rate limits and transient failures."""
-    url = f"{API_BASE}/bot{cfg.require_token()}/{method}"
-
-    for attempt in range(1, attempts + 1):
+async def send_to_all(client: TelegramClient, cfg: Config, text: str) -> int:
+    succeeded = 0
+    for chat_id in cfg.require_chat_ids():
         try:
-            response = requests.post(url, json=payload or {}, timeout=30)
-        except requests.RequestException as exc:
-            if attempt == attempts:
-                raise RuntimeError(f"network error calling {method}: {exc}") from exc
-            delay = 2 ** attempt
-            log.warning("Network error on %s (%s). Retrying in %ss.", method, exc, delay)
-            time.sleep(delay)
-            continue
-
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-
-        if body.get("ok"):
-            return body["result"]
-
-        description = body.get("description", response.text[:200])
-
-        if response.status_code == 429:
-            delay = int(body.get("parameters", {}).get("retry_after", 30))
-            log.warning("Rate limited by Telegram. Waiting %ss.", delay)
-            time.sleep(delay)
-            continue
-
-        if response.status_code >= 500 and attempt < attempts:
-            delay = 2 ** attempt
-            log.warning("Telegram returned %s. Retrying in %ss.", response.status_code, delay)
-            time.sleep(delay)
-            continue
-
-        raise RuntimeError(f"{method} failed ({response.status_code}): {description}")
-
-    raise RuntimeError(f"{method} failed after {attempts} attempts")
-
-
-def send_message(cfg: Config, text: str) -> dict:
-    payload: dict = {
-        "chat_id": cfg.require_chat_id(),
-        "text": text,
-        "disable_notification": cfg.silent,
-    }
-    if cfg.parse_mode and cfg.parse_mode.lower() != "none":
-        payload["parse_mode"] = cfg.parse_mode
-    if cfg.thread_id:
-        payload["message_thread_id"] = int(cfg.thread_id)
-    return call_api(cfg, "sendMessage", payload)
+            entity = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+            await client.send_message(entity, text, parse_mode="html")
+            log.info("Sent to %s", chat_id)
+            succeeded += 1
+        except FloodWaitError as e:
+            log.warning("Flood wait %ss for %s, sleeping...", e.seconds, chat_id)
+            await asyncio.sleep(e.seconds)
+            try:
+                await client.send_message(entity, text, parse_mode="html")
+                log.info("Sent to %s (after wait)", chat_id)
+                succeeded += 1
+            except Exception as exc:
+                log.error("Failed to send to %s after flood wait: %s", chat_id, exc)
+        except (ChatWriteForbiddenError, ChannelPrivateError) as exc:
+            log.error("Cannot send to %s: %s", chat_id, exc)
+        except Exception as exc:
+            log.error("Failed to send to %s: %s", chat_id, exc)
+    return succeeded
 
 
 # --------------------------------------------------------------------------- #
-# Health endpoint (only used when the host provides a PORT)
+# Health endpoint
 # --------------------------------------------------------------------------- #
 
 def start_health_server(port: int, status: dict) -> None:
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - name required by BaseHTTPRequestHandler
+        def do_GET(self) -> None:
             body = json.dumps(status).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -239,7 +222,7 @@ def start_health_server(port: int, status: dict) -> None:
             self.wfile.write(body)
 
         def log_message(self, *args) -> None:
-            pass  # keep health checks out of the logs
+            pass
 
     server = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -250,114 +233,123 @@ def start_health_server(port: int, status: dict) -> None:
 # Commands
 # --------------------------------------------------------------------------- #
 
-def cmd_once(cfg: Config) -> int:
+async def cmd_once(cfg: Config) -> int:
     messages = load_messages(cfg)
     text = pick_message(cfg, messages)
-    result = send_message(cfg, text)
-    log.info("Sent message %s to chat %s", result.get("message_id"), cfg.chat_id)
+    client = await cfg.get_client()
+    try:
+        sent = await send_to_all(client, cfg, text)
+        log.info("Sent to %d/%d group(s)", sent, len(cfg.chat_ids))
+    finally:
+        await client.disconnect()
     return 0
 
 
-def cmd_loop(cfg: Config) -> int:
+async def cmd_loop(cfg: Config) -> int:
     messages = load_messages(cfg)
+    chat_ids = cfg.require_chat_ids()
     log.info(
-        "Starting: %d message(s), every %ss, rotation=%s, chat=%s",
-        len(messages), cfg.interval, cfg.rotation, cfg.require_chat_id(),
+        "Starting: %d message(s), every %ss, rotation=%s, %d group(s)",
+        len(messages), cfg.interval, cfg.rotation, len(chat_ids),
     )
-
-    stop = threading.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
 
     status = {"state": "starting", "sent": 0, "interval_seconds": cfg.interval}
     if cfg.port:
         start_health_server(int(cfg.port), status)
 
-    next_run = time.monotonic()
-    if not cfg.send_on_start:
-        next_run += cfg.interval
-        log.info("SEND_ON_START is off; first message in %ss", cfg.interval)
+    client = await cfg.get_client()
+    try:
+        me = await client.get_me()
+        log.info("Logged in as %s (id %s)", me.first_name, me.id)
 
-    status["state"] = "running"
+        stop = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                signal.signal(sig, lambda *_: stop.set())
 
-    while not stop.is_set():
-        wait_for = next_run - time.monotonic()
-        if wait_for > 0:
-            if stop.wait(wait_for):
-                break
-
-        try:
-            text = pick_message(cfg, messages)
-            result = send_message(cfg, text)
-            status["sent"] += 1
-            status["last_sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
-            status.pop("last_error", None)
-            log.info("Sent message %s (%d total)", result.get("message_id"), status["sent"])
-        except RuntimeError as exc:
-            status["last_error"] = str(exc)
-            log.error("Send failed: %s", exc)
-
-        # Anchor on the schedule rather than on when the send finished, and skip
-        # any slots that a long outage caused us to miss.
-        now = time.monotonic()
-        while next_run <= now:
+        next_run = time.monotonic()
+        if not cfg.send_on_start:
             next_run += cfg.interval
+            log.info("SEND_ON_START is off; first message in %ss", cfg.interval)
+
+        status["state"] = "running"
+
+        while not stop.is_set():
+            wait_for = next_run - time.monotonic()
+            if wait_for > 0:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=wait_for)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+            text = pick_message(cfg, messages)
+            sent = await send_to_all(client, cfg, text)
+            status["sent"] += sent
+            status["last_sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
+            log.info("Sent to %d/%d group(s) (%d total)", sent, len(chat_ids), status["sent"])
+
+            now = time.monotonic()
+            while next_run <= now:
+                next_run += cfg.interval
+    finally:
+        await client.disconnect()
 
     log.info("Stopped after sending %d message(s).", status["sent"])
     return 0
 
 
-def cmd_check(cfg: Config) -> int:
-    me = call_api(cfg, "getMe")
-    log.info("Token OK: @%s (%s)", me.get("username"), me.get("first_name"))
+async def cmd_check(cfg: Config) -> int:
+    client = await cfg.get_client()
+    try:
+        me = await client.get_me()
+        log.info("Logged in as: %s %s (id %s)", me.first_name, me.last_name or "", me.id)
 
-    if not cfg.chat_id:
-        log.warning("TELEGRAM_CHAT_ID is not set. Run `python bot.py chat-id` next.")
-        return 1
+        if not cfg.chat_ids:
+            log.warning("TELEGRAM_CHAT_ID is not set. Run `python bot.py groups` to find ids.")
+            return 1
 
-    chat = call_api(cfg, "getChat", {"chat_id": cfg.chat_id})
-    log.info(
-        "Chat OK: %s (%s, id %s)",
-        chat.get("title") or chat.get("username"), chat.get("type"), chat.get("id"),
-    )
+        for chat_id in cfg.chat_ids:
+            try:
+                entity = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+                chat = await client.get_entity(entity)
+                title = getattr(chat, "title", None) or getattr(chat, "username", chat_id)
+                log.info("Group OK: %s (id %s)", title, chat_id)
+            except Exception as exc:
+                log.error("Group %s failed: %s", chat_id, exc)
 
-    messages = load_messages(cfg)
-    log.info("Loaded %d message(s); sending every %ss.", len(messages), cfg.interval)
-    log.info("Next message would be:\n%s", messages[read_state(cfg).get("index", 0) % len(messages)])
+        messages = load_messages(cfg)
+        log.info("Loaded %d message(s); sending every %ss.", len(messages), cfg.interval)
+    finally:
+        await client.disconnect()
     return 0
 
 
-def cmd_chat_id(cfg: Config) -> int:
-    """Show chats from recent updates so you can copy the group's id."""
-    updates = call_api(cfg, "getUpdates", {"limit": 100})
-    seen: dict[int, str] = {}
-    for update in updates:
-        for key in ("message", "channel_post", "my_chat_member", "edited_message"):
-            chat = (update.get(key) or {}).get("chat")
-            if chat:
-                label = chat.get("title") or chat.get("username") or chat.get("first_name", "")
-                seen[chat["id"]] = f"{label} ({chat.get('type')})"
-
-    if not seen:
-        log.info(
-            "No chats seen yet. Add the bot to your group, send any message there, "
-            "then run this again. If the bot has privacy mode on, make it an admin "
-            "or send it a message that starts with /."
-        )
-        return 1
-
-    log.info("Chats the bot can see:")
-    for chat_id, label in seen.items():
-        log.info("  %-16s %s", chat_id, label)
-    log.info("Copy the id of your group into TELEGRAM_CHAT_ID (groups look like -100...).")
+async def cmd_groups(cfg: Config) -> int:
+    client = await cfg.get_client()
+    try:
+        log.info("Groups and channels you've joined:")
+        async for dialog in client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                log.info("  %-16s %s", dialog.entity.id, dialog.title)
+        log.info("Copy the id(s) into TELEGRAM_CHAT_ID (comma-separated for multiple).")
+    finally:
+        await client.disconnect()
     return 0
 
 
-COMMANDS = {"loop": cmd_loop, "once": cmd_once, "check": cmd_check, "chat-id": cmd_chat_id}
+COMMANDS = {
+    "loop": cmd_loop,
+    "once": cmd_once,
+    "check": cmd_check,
+    "groups": cmd_groups,
+}
 
 
 def main() -> int:
-    # Windows consoles default to a legacy code page, which raises on emoji.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -378,8 +370,9 @@ def main() -> int:
         print(f"Unknown command: {name!r}")
         return 2
 
+    cfg = Config()
     try:
-        return command(Config())
+        return asyncio.run(command(cfg))
     except RuntimeError as exc:
         log.error("%s", exc)
         return 1

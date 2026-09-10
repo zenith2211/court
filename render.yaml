@@ -18,8 +18,12 @@ services:
     startCommand: python bot.py loop
     healthCheckPath: /
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      - key: TELEGRAM_API_ID
         sync: false # set this in the Render dashboard, never in git
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_PHONE
+        sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: INTERVAL
