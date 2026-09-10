@@ -107,9 +107,21 @@ class Config:
         api_id, api_hash = self.require_api_credentials()
         session_path = str(ROOT / self.session_name)
 
+        secret_path = Path("/etc/secrets/user_session.session")
+        if secret_path.exists() and not Path(session_path + ".session").exists():
+            import shutil
+            shutil.copy2(secret_path, session_path + ".session")
+            log.info("Restored session from secret file.")
+
         session_b64 = os.environ.get("TELEGRAM_SESSION", "").strip()
         if session_b64 and not Path(session_path + ".session").exists():
-            Path(session_path + ".session").write_bytes(base64.b64decode(session_b64))
+            import zlib
+            raw = base64.b64decode(session_b64)
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                pass
+            Path(session_path + ".session").write_bytes(raw)
             log.info("Restored session from TELEGRAM_SESSION env var.")
 
         client = TelegramClient(session_path, api_id, api_hash)
