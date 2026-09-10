@@ -202,6 +202,17 @@ def pick_message(cfg: Config, messages: list[str]) -> str:
 # Sending
 # --------------------------------------------------------------------------- #
 
+async def ensure_connected(client: TelegramClient) -> bool:
+    if not client.is_connected():
+        log.warning("Client disconnected, reconnecting...")
+        await client.connect()
+        if not await client.is_user_authorized():
+            log.error("Session expired after reconnect.")
+            return False
+        log.info("Reconnected successfully.")
+    return True
+
+
 async def send_to_all(client: TelegramClient, cfg: Config, text: str) -> int:
     succeeded = 0
     for chat_id in cfg.require_chat_ids():
@@ -219,6 +230,15 @@ async def send_to_all(client: TelegramClient, cfg: Config, text: str) -> int:
                 succeeded += 1
             except Exception as exc:
                 log.error("Failed to send to %s after flood wait: %s", chat_id, exc)
+        except ConnectionError:
+            log.warning("Disconnected while sending to %s, reconnecting...", chat_id)
+            if await ensure_connected(client):
+                try:
+                    await client.send_message(entity, text, parse_mode="html")
+                    log.info("Sent to %s (after reconnect)", chat_id)
+                    succeeded += 1
+                except Exception as exc:
+                    log.error("Failed to send to %s after reconnect: %s", chat_id, exc)
         except (ChatWriteForbiddenError, ChannelPrivateError) as exc:
             log.error("Cannot send to %s: %s", chat_id, exc)
         except Exception as exc:
@@ -304,6 +324,10 @@ async def cmd_loop(cfg: Config) -> int:
                     break
                 except asyncio.TimeoutError:
                     pass
+
+            if not await ensure_connected(client):
+                log.error("Cannot re-authorize on server, stopping.")
+                break
 
             text = pick_message(cfg, messages)
             sent = await send_to_all(client, cfg, text)
