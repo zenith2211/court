@@ -276,6 +276,11 @@ def start_health_server(port: int, status: dict) -> None:
             self.end_headers()
             self.wfile.write(body)
 
+        def do_HEAD(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
         def log_message(self, *args) -> None:
             pass
 
