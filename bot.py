@@ -250,6 +250,22 @@ async def send_to_all(client: TelegramClient, cfg: Config, text: str) -> int:
 # Health endpoint
 # --------------------------------------------------------------------------- #
 
+def start_self_ping(url: str, interval: int = 300) -> None:
+    """Ping our own public URL to prevent Render free tier from sleeping."""
+    import urllib.request
+
+    def _ping() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                urllib.request.urlopen(url, timeout=30)
+            except Exception:
+                pass
+
+    threading.Thread(target=_ping, daemon=True).start()
+    log.info("Self-ping every %ds to %s", interval, url)
+
+
 def start_health_server(port: int, status: dict) -> None:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -295,6 +311,9 @@ async def cmd_loop(cfg: Config) -> int:
     status = {"state": "starting", "sent": 0, "interval_seconds": cfg.interval}
     if cfg.port:
         start_health_server(int(cfg.port), status)
+        service_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        if service_url:
+            start_self_ping(service_url)
 
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
